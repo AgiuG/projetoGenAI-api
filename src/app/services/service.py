@@ -99,6 +99,7 @@ class Service:
 
         index_page = None
         section_number_page = None
+        found_section = target_section
 
         for index, page in enumerate(pages):
             if f"{target_section} " in page and ("Índice" in page or index < 5):
@@ -108,6 +109,23 @@ class Service:
                     section_number_page = int(match.group(2))
                     index_page = index
                     break
+
+        if section_number_page is None:
+            pattern_with_slash = rf"{re.escape(target_section)}/[\d\.]+"
+
+            for index, page in enumerate(pages):
+                if "Índice" in page or index < 5:
+                    match = re.search(
+                        rf"({pattern_with_slash})\s+([^\n]+)\s*(\d+)", page
+                    )
+                    if match:
+                        found_section = match.group(1)  # Ex: "9.1/9.2"
+                        section_number_page = int(match.group(3))
+                        index_page = index
+                        print(
+                            f"📌 Seção {target_section} encontrada como '{found_section}'"
+                        )
+                        break
 
         if section_number_page is None:
             print(f"⚠️  Seção {target_section} não encontrada. Tentando fallback...")
@@ -134,14 +152,12 @@ class Service:
                 or f"PÁGINA: {section_number_page}" in page
             ):
                 pattern_section = (
-                    rf"^{re.escape(target_section)}\s+([A-Za-zÀ-ÿ].{{10,}}.*?)$"
+                    rf"^{re.escape(found_section)}\s+([A-Za-zÀ-ÿ].{{10,}}.*?)$"
                 )
-
                 match_section = re.search(pattern_section, page, re.MULTILINE)
 
                 if match_section:
                     full_title = match_section.group(0).strip()
-
                     content_start = match_section.end()
                     page_content = page[content_start:]
 
@@ -164,16 +180,59 @@ class Service:
                     break
 
         if not full_title:
-            return f"Erro: Não foi possível encontrar o conteúdo da seção '{section_number_page}' na página indicada."
+            print(
+                f"⚠️  Conteúdo da seção {target_section} não encontrado na página {section_number_page}. Tentando fallback..."
+            )
+
+            ### 🔧 ADIÇÃO: fallback alternativo baseado em intervalo de páginas
+            start_page = section_number_page
+            end_page = section_number_page + 5  # pode ajustar para +10 se quiser
+            extra_content = []
+
+            for page in pages:
+                for target_page in range(start_page, end_page + 1):
+                    if f"PÁGINA: {target_page}" in page or f"{target_page} " in page:
+                        lines = page.split("\n")
+                        cleared_lines = []
+                        for line in lines:
+                            cleared_line = line.strip()
+                            if (
+                                cleared_line
+                                and "PÁGINA:" not in cleared_line
+                                and "Formulário de Referência" not in cleared_line
+                                and "Versão" not in cleared_line
+                                and not cleared_line.isdigit()
+                                and len(cleared_line) > 2
+                                and f"--- PÁGINA {target_page}" not in cleared_line
+                            ):
+                                cleared_lines.append(line)
+                        if cleared_lines:
+                            extra_content.extend(cleared_lines)
+
+            if extra_content:
+                print(
+                    f"✓ Fallback de intervalo aplicado: extraindo páginas {start_page}-{end_page}"
+                )
+                return "\n".join(extra_content)
+
+            prev_section, next_section = self._get_section_range(target_section)
+            fallback_content = self._extract_section_range(
+                full_text, prev_section, next_section
+            )
+            if fallback_content:
+                print(
+                    f"✓ Fallback bem-sucedido: extraindo de {prev_section} até {next_section}"
+                )
+                return fallback_content
+            else:
+                return f"Erro: Não foi possível encontrar o conteúdo da seção '{target_section}' (página {section_number_page}) mesmo com fallback."
 
         current_level = len(target_section.split("."))
-
         next_section_number = None
         next_section_page = None
 
         if index_page is not None:
             page_index_text = pages[index_page]
-
             pattern_all_sections = r"(\d+(?:\.\d+)*)\s+([^\n]+)\s*(\d+)"
             full_sections = re.findall(pattern_all_sections, page_index_text)
 
@@ -185,7 +244,7 @@ class Service:
                         next_section_number = number
                         next_section_page = int(number_page)
                         break
-                elif number == target_section:
+                elif number == target_section or number == found_section:
                     current_section_found = True
 
         if next_section_page:
@@ -272,6 +331,60 @@ class Service:
 
         return response.text
 
+    def _build_prompt_for_question(
+        self, pergunta_obj: dict, contexto_da_secao: str
+    ) -> str:
+        tipo_resposta = pergunta_obj.get("TipoDeResposta")
+
+        if tipo_resposta == "Classificacao":
+            if not pergunta_obj.get("OpcoesDeResposta"):
+                raise ValueError(
+                    f"Pergunta de classificação Nº{pergunta_obj.get('Nº')} não tem 'OpcoesDeResposta'"
+                )
+
+            prompt = f"""### TAREFA ###
+            Você é um especialista em classificação de texto. Sua única tarefa é ler o texto fornecido e classificá-lo em UMA das categorias permitidas, com base nos critérios definidos.
+
+            ### TEXTO PARA ANÁLISE ###
+            {contexto_da_secao}
+
+            ### PERGUNTA DE CLASSIFICAÇÃO ###
+            {pergunta_obj["Questao"]}
+
+            ### CRITÉRIOS DE ANÁLISE (COMO PENSAR) ###
+            {pergunta_obj["CriteriosDeAnalise"]}
+
+            ### OPÇÕES DE RESPOSTA VÁLIDAS (O QUE RESPONDER) ###
+            - {"\n- ".join(pergunta_obj["OpcoesDeResposta"])}
+
+            ### INSTRUÇÕES DE SAÍDA ###
+            Sua resposta deve ser APENAS UMA das opções listadas acima. Não inclua explicações, aspas, pontuação ou qualquer outro texto.
+
+            ### CLASSIFICAÇÃO FINAL ###"""
+            return prompt.strip()
+
+        elif tipo_resposta in ["ExtracaoNumerica", "ExtracaoTexto"]:
+            prompt = f"""### TAREFA ###
+            Você é um sistema preciso de extração de dados. Sua função é analisar o texto fonte para responder a uma pergunta específica, seguindo rigorosamente as regras de formatação.
+
+            ### TEXTO FONTE ###
+            {contexto_da_secao}
+
+            ### DADO A SER EXTRAÍDO ###
+            {pergunta_obj["Questao"]}
+
+            ### INSTRUÇÕES DE EXTRAÇÃO (COMO ENCONTRAR O DADO) ###
+            {pergunta_obj["CriteriosDeAnalise"]}
+
+            ### REGRAS DE FORMATAÇÃO DA SAÍDA ###
+            {pergunta_obj.get("RegrasDeFormatacao", "Nenhuma regra de formatação específica.")}
+
+            ### INSTRUÇÕES DE SAÍDA ###
+            Sua resposta deve conter APENAS o dado final extraído e formatado, sem nenhum texto explicativo, rótulo ou introdução.
+
+            ### DADO EXTRAÍDO ###"""
+            return prompt.strip()
+
     async def extract_response(self, path_file: str, task_id=None):
         if task_id:
             task_storage.update_task(task_id, status="processing")
@@ -306,8 +419,6 @@ class Service:
             try:
                 section_numbers = question.get("Onde")
                 question_text = question.get("Questao")
-                how_to_fill = question.get("ComoPreencher")
-                observations = question.get("OBSERVACOES")
                 question_number = question.get("Nº")
 
                 if task_id:
@@ -333,13 +444,8 @@ class Service:
                         task_storage.fail_task(task_id, error_msg)
                     return error_msg
 
-                prompt = f"""
-                {question_text}
+                prompt = self._build_prompt_for_question(question, full_content)
 
-                Retorne apenas como é pedido aqui:{how_to_fill}
-
-                {observations}
-                """
                 answer = await self._get_answer(
                     "extracted_section.txt", prompt, question_number=question_number
                 )
